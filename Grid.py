@@ -235,7 +235,7 @@ red_mask_1st = mask1 + mask2
 morph_1st = cv2.morphologyEx(red_mask_1st, cv2.MORPH_CLOSE, kernel)
 only_red_stages[1] = np.where(morph_1st[:, :, np.newaxis] > 127, current_img, white_background)
 
-for stage in range(2, MAX_STAGES + 1):
+for stage in range(1, MAX_STAGES + 1):
     prev_img = only_red_stages[stage - 1].copy()
     hsv_stage = cv2.cvtColor(prev_img, cv2.COLOR_BGR2HSV)
     
@@ -342,7 +342,35 @@ try:
         combined_results = []
         for r in results_pure: combined_results.append((r, "Pure"))
         for r_c in results_custom: combined_results.append((r_c, "Custom"))
-        
+            
+        # 1. 신뢰도(prob) 점수가 높은 순서대로 정렬
+        combined_results.sort(key=lambda x: x[0][2], reverse=True)
+
+        accepted_results = []
+        for (bbox, text, prob), source in combined_results:
+            pts = np.array(bbox, dtype=np.int32)
+            bx, by, bw, bh = cv2.boundingRect(pts)
+            current_center_x = bx + bw / 2.0
+            current_center_y = by + bh / 2.0
+
+            # 2. 이미 채택된 고신뢰도 결과의 좌표와 비교하여 중복 여부 체크
+            is_duplicate = False
+            for (a_bbox, a_text, a_prob), a_source in accepted_results:
+                a_pts = np.array(a_bbox, dtype=np.int32)
+                abx, aby, abw, abh = cv2.boundingRect(a_pts)
+                assigned_center_x = abx + abw / 2.0
+                assigned_center_y = aby + abh / 2.0
+
+                # 두 글자의 중심점 거리가 15픽셀 이내라면 동일한 위치의 스탬프로 판단
+                distance = np.sqrt((current_center_x - assigned_center_x)**2 + (current_center_y - assigned_center_y)**2)
+                if distance < 15:  # 도면 해상도에 따라 10~25 사이로 조절 가능
+                    is_duplicate = True
+                    break
+
+            # 3. 중복되지 않은 가장 정답에 가까운(prob가 높은) 결과만 최종 루프에 진입시킴
+            if not is_duplicate:
+                accepted_results.append(((bbox, text, prob), source))
+
         for (bbox, text, prob), source in combined_results:
             raw_text = str(text).upper().strip()
             
@@ -393,10 +421,17 @@ try:
                     stage_fail_buffer.append(f"  [실패] {source} -> 추출조각문자: '{num_str}' | 원인: 수치 형식 변환 실패")
                     continue
 
-                center_x = int(np.mean(pts[:, 0]) / scale_factor)
-                center_y = int(np.mean(pts[:, 1]) / scale_factor)
-                
+                bx, by, bw, bh = cv2.boundingRect(pts)
+                center_x = int((bx + bw / 2.0) / scale_factor)
+                center_y = int((by + bh / 2.0) / scale_factor)
+
+                center_x = max(0, min(w - 1, center_x))
+                center_y = max(0, min(h - 1, center_y))
+
                 assigned_row, assigned_col = None, None
+                EPSILON = 2  # 픽셀 단위 여유 마진
+
+                
                 for r_idx in range(num_rows):
                     if y_bounds[r_idx] <= center_y <= y_bounds[r_idx+1]:
                         assigned_row = rows[r_idx]
