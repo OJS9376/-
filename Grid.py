@@ -1,644 +1,677 @@
-import sys
+import base64
+import requests
+import json
 import os
-import cv2
-import numpy as np
+import io
+import sys
 import re
-import warnings
-import csv
-import multiprocessing
-from tkinter import filedialog, Tk
+from pdf2image import convert_from_path
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
 
-# ==========================================
-# 1단계: 필수 의존성 라이브러리 및 딥러닝 엔진 검증
-# ==========================================
-try:
-    import fitz  # PyMuPDF
-    import torch
-    import torch.nn as nn
-    import easyocr
-    from easyocr.recognition import get_recognizer
-    from easyocr.utils import CTCLabelConverter
-    from easyocr.model.model import Model as EasyOCRModel
-except ImportError as e:
-    print("Error: Missing library. Please run 'pip install pymupdf easyocr torch'.")
-    input("Press Enter to exit...")
-    sys.exit(-1)
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, 
+                             QFileDialog, QLabel, QMessageBox, QHeaderView, QAbstractItemView)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRect, QPoint, QSize, QBuffer, QByteArray
+from PyQt6.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QImage, QTransform
 
-def show_exception_and_exit(exc_type, exc_value, tb):
-    import traceback
-    print("\n" + "="*50)
-    print("Program stopped due to an error.")
-    print("="*50)
-    traceback.print_exception(exc_type, exc_value, tb)
-    print("="*50)
-    input("Press Enter to exit...")
-    sys.exit(-1)
+# ==============================================================================
+# [설정 파일 및 경로 입력]
+# ==============================================================================
+LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+BASE_DIR = os.getcwd()
+POPPLER_PATH = os.path.join(BASE_DIR, "poppler", "Library", "bin")
+DATASET_DIR = os.path.join(BASE_DIR, "training_dataset")
 
-sys.excepthook = show_exception_and_exit
-warnings.filterwarnings("ignore", category=UserWarning)
-os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+if not os.path.exists(DATASET_DIR):
+    os.makedirs(DATASET_DIR)
 
-# PyInstaller 임시 폴더 경로 인식 함수 (전역 배치)
-def get_resource_path(relative_path):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+# ==============================================================================
+# [고해상도 인터랙티브 이미지 캔버스 정의]
+# ==============================================================================
+class DrawingCanvas(QLabel):
+    drag_finished_signal = pyqtSignal(QRect, QRect)
 
-# 윈도우 환경 멀티프로세싱 크래시 방지 구동
-multiprocessing.freeze_support()
-
-# ==========================================
-# 2단계: 파일 탐색기를 통한 도면 선택
-# ==========================================
-root = Tk()
-root.withdraw()
-root.attributes('-topmost', True)  # 파일 선택창을 화면 맨 위로 강제 호출
-print("Select your drawing file (Image or PDF)...")
-file_path = filedialog.askopenfilename(
-    title="Select Drawing File",
-    filetypes=[
-        ("All Supported Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.gif;*.pdf"),
-        ("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.gif"),
-        ("PDF Files", "*.pdf"),
-        ("All Files", "*.*")
-    ]
-)
-
-if not file_path:
-    print("File selection canceled. Program terminated.")
-    sys.exit()
-
-if isinstance(file_path, tuple) and len(file_path) > 0:
-    file_path = file_path[0]
-
-print("Selected file: " + os.path.basename(file_path))
-root.destroy()
-
-# ==========================================
-# 3단계: 고해상도 이미지 및 PDF 변환 로드
-# ==========================================
-image = None
-_, ext_check = os.path.splitext(file_path.lower())
-
-if ext_check == '.pdf':
-    try:
-        print("Converting PDF to high-quality image...")
-        doc = fitz.open(file_path)
-        page = doc[0]  
-        zoom = 4.0  
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
-        image = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        doc.close()
-    except Exception as e:
-        print("Error reading PDF:", e)
-        image = None
-else:
-    try:
-        img_array = np.fromfile(file_path, np.uint8)
-        image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    except Exception as e:
-        image = None
-
-if image is None:
-    print("Failed to load image. Please check the file.")
-    sys.exit()
-
-h, w, _ = image.shape
-
-# ==========================================
-# 4단계: 고급 마우스 휠 줌 및 패닝 윈도우 가동
-# ==========================================
-cv2.namedWindow("Drawing Grid", cv2.WINDOW_AUTOSIZE)
-
-zoom_factor = min(1024.0 / w, 768.0 / h)
-pan_x = (1024 - w * zoom_factor) / 2
-pan_y = (768 - h * zoom_factor) / 2
-is_dragging = False
-start_x, start_y = 0, 0
-
-x_lines = []
-y_lines = []
-current_mode = "vertical"  
-
-def redraw_window():
-    global zoom_factor, pan_x, pan_y, current_mode, x_lines, y_lines
-    canvas = image.copy()
-    for x in x_lines:
-        cv2.line(canvas, (x, 0), (x, h), (255, 0, 0), 2)
-    for y in y_lines:
-        cv2.line(canvas, (0, y), (w, y), (0, 0, 255), 2)
-
-    M = np.float32([[zoom_factor, 0, pan_x], [0, zoom_factor, pan_y]])
-    display_img = cv2.warpAffine(canvas, M, (1024, 768))
-    mode_text = f"Mode: {current_mode.upper()} | L-Click: Add | R-Click: Undo Line | Enter: Next"
-    cv2.putText(display_img, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
-    cv2.imshow("Drawing Grid", display_img)
-
-def mouse_callback(event, x, y, flags, param):
-    global zoom_factor, pan_x, pan_y, is_dragging, start_x, start_y, current_mode, x_lines, y_lines
-    orig_x = int((x - pan_x) / zoom_factor)
-    orig_y = int((y - pan_y) / zoom_factor)
-
-    if event == cv2.EVENT_MBUTTONDOWN:
-        is_dragging = True
-        start_x, start_y = x, y
-    elif event == cv2.EVENT_MOUSEMOVE:
-        if is_dragging:
-            pan_x += x - start_x
-            pan_y += y - start_y
-            start_x, start_y = x, y
-            redraw_window()
-    elif event == cv2.EVENT_MBUTTONUP:
-        is_dragging = False
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        if current_mode == "vertical" and x_lines:
-            x_lines.pop(); redraw_window()
-        elif current_mode == "horizontal" and y_lines:
-            y_lines.pop(); redraw_window()
-    elif event == cv2.EVENT_MOUSEWHEEL:
-        old_zoom = zoom_factor
-        zoom_factor *= 1.15 if flags > 0 else (1.0 / 1.15)
-        zoom_factor = max(0.05, min(zoom_factor, 50.0))
-        pan_x = x - (x - pan_x) * (zoom_factor / old_zoom)
-        pan_y = y - (y - pan_y) * (zoom_factor / old_zoom)
-        redraw_window()
-    elif event == cv2.EVENT_LBUTTONDOWN:
-        if 0 <= orig_x <= w and 0 <= orig_y <= h:
-            if current_mode == "vertical":
-                x_lines.append(orig_x); x_lines.sort()
-            elif current_mode == "horizontal":
-                y_lines.append(orig_y); y_lines.sort()
-            redraw_window()
-
-cv2.setMouseCallback("Drawing Grid", mouse_callback)
-
-print("Mode: VERTICAL. Press Enter when done.")
-while True:
-    redraw_window()
-    key = cv2.waitKey(1) & 0xFF
-    if key == 13 or key == 10:  
-        if current_mode == "vertical":
-            current_mode = "horizontal"
-            print("Mode: HORIZONTAL. Press Enter when done.")
-        elif current_mode == "horizontal":
-            current_mode = "done"
-            break
-    elif key == 27:  
-        print("Canceled.")
-        cv2.destroyAllWindows()
-        sys.exit()
-
-cv2.destroyAllWindows()
-import traceback
-
-print("\n" + "="*50)
-try:
-    max_num_input = input("이 도면의 최대 일련번호(넘버링 끝 숫자)를 입력하세요 (예: 120): ").strip()
-    MAX_ALLOWED_NUMBER = int(max_num_input)
-    print(f"-> 1부터 {MAX_ALLOWED_NUMBER} 범위 내의 숫자만 유효 데이터로 정밀 필터링합니다.")
-except ValueError:
-    MAX_ALLOWED_NUMBER = 999  
-    print("-> 올바른 숫자가 입력되지 않아 기본 제한(999)으로 진행합니다.")
-print("="*50 + "\n")
-
-# [보정 완료]: 구석 0 좌표를 강제로 배열에 묶어주어 도면 테두리 끝단 그리드 활성화
-x_bounds = sorted(list(set([0] + x_lines + [w])))
-y_bounds = sorted(list(set([0] + y_lines + [h])))
-num_cols, num_rows = len(x_bounds) - 1, len(y_bounds) - 1
-
-row_labels = ["F", "E", "D", "C", "B", "A"]
-rows = row_labels[-num_rows:] if num_rows <= len(row_labels) else [chr(65 + num_rows - 1 - i) for i in range(num_rows)]
-cols = [str(i + 1) for i in range(num_cols)]
-
-scale_factor = 2.0
-img_resized = cv2.resize(image, (None, None), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
-white_background = np.ones_like(img_resized) * 255
-
-# [수정 완료]: 600 DPI 고해상도 도면에 맞춰 스탬프 원 마크를 강력하게 격리하는 대형 커널로 스케일업
-kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-
-MAX_STAGES = 30
-hsv_thresholds = []
-for i in range(MAX_STAGES):
-    val = int(20 + (145 / (MAX_STAGES - 1)) * i)
-    hsv_thresholds.append({"s_min": min(val, 165), "v_min": min(val, 165)})
-
-only_red_stages = {}
-
-current_img = img_resized.copy()
-hsv_1st = cv2.cvtColor(current_img, cv2.COLOR_BGR2HSV)
-mask1 = cv2.inRange(hsv_1st, np.array([0, hsv_thresholds[0]["s_min"], hsv_thresholds[0]["v_min"]]), np.array([10, 255, 255]))
-mask2 = cv2.inRange(hsv_1st, np.array([160, hsv_thresholds[0]["s_min"], hsv_thresholds[0]["v_min"]]), np.array([180, 255, 255]))
-red_mask_1st = mask1 + mask2
-morph_1st = cv2.morphologyEx(red_mask_1st, cv2.MORPH_CLOSE, kernel)
-only_red_stages[1] = np.where(morph_1st[:, :, np.newaxis] > 127, current_img, white_background)
-
-for stage in range(1, MAX_STAGES + 1):
-    prev_img = only_red_stages[stage - 1].copy()
-    hsv_stage = cv2.cvtColor(prev_img, cv2.COLOR_BGR2HSV)
-    
-    s_val = hsv_thresholds[stage - 1]["s_min"]
-    v_val = hsv_thresholds[stage - 1]["v_min"]
-    
-    m1 = cv2.inRange(hsv_stage, np.array([0, s_val, v_val]), np.array([10, 255, 255]))
-    m2 = cv2.inRange(hsv_stage, np.array([160, s_val, v_val]), np.array([180, 255, 255]))
-    stage_mask = m1 + m2
-    
-    morph_stage = cv2.morphologyEx(stage_mask, cv2.MORPH_CLOSE, kernel)
-    only_red_stages[stage] = np.where(morph_stage[:, :, np.newaxis] > 127, prev_img, white_background)
-
-cross_validated_raw_data = {}
-successfully_detected_numbers = set()
-
-# 디버깅용 텍스트 보고서 파일 생성 초기화
-base_dir = os.path.dirname(file_path)
-file_name_only, _ = os.path.splitext(os.path.basename(file_path))
-txt_log_path = os.path.join(base_dir, f"{file_name_only}_ocr_debug_log.txt")
-
-with open(txt_log_path, "w", encoding="utf-8") as log_f:
-    log_f.write("==================================================\n")
-    log_f.write(f" OCR AI Misrecognition Error Audit Report\n")
-    log_f.write(f" Target Drawing: {os.path.basename(file_path)}\n")
-    log_f.write(" [성공 제거 / 실패 및 오인식 집중 추적 가동 (문턱값 0.05 완화본)]\n")
-    log_f.write("==================================================\n\n")
-try:
-    print("Initializing Dual Hybrid OCR Engine (Pure + Custom ResNet)...")
-    import torch
-    import torch.nn as nn
-    from easyocr.model.model import Model as EasyOCRModel
-    from easyocr.utils import CTCLabelConverter
-
-    reader_pure = easyocr.Reader(['en'], gpu=True) 
-
-    custom_model_dir = get_resource_path("custom_models")
-    reader_custom = easyocr.Reader(['en'], gpu=True, model_storage_directory=custom_model_dir)
-    digit_chars = '0123456789'
-    reader_custom.character = digit_chars
-    reader_custom.converter = CTCLabelConverter(digit_chars)
-
-    custom_recognizer = EasyOCRModel(1, 512, 256, 11)
-    
-    pth_absolute_path = os.path.join(custom_model_dir, "ko_g2.pth")
-    if not os.path.exists(pth_absolute_path):
-        pth_absolute_path = r"C:\Users\win10\.EasyOCR\model\custom_drawing_easyocr_ResNet.pth"
+    def __init__(self):
+        super().__init__()
+        self.setMouseTracking(True)
+        self.setStyleSheet("background-color: #ECECEC; border: 1px solid #B0B0B0;")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(100, 100)
+        self.setScaledContents(False)
         
-    state_dict = torch.load(pth_absolute_path, map_location='cuda' if torch.cuda.is_available() else 'cpu', weights_only=False)
-    
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key.startswith("module."):
-            new_key = key
-        else:
-            new_key = f"module.{key}"
-        new_state_dict[new_key] = value
+        self.original_pixmap = None
+        self.zoom_factor = 1.0
+        self.pan_offset = QPoint(0, 0)
+        self.last_mouse_pos = QPoint()
         
-    custom_recognizer = nn.DataParallel(custom_recognizer)
-    if torch.cuda.is_available():
-        custom_recognizer = custom_recognizer.cuda()
-    custom_recognizer.load_state_dict(new_state_dict, strict=True)
-    
-    if hasattr(reader_custom, 'recognizer'):
-        reader_custom.recognizer = custom_recognizer
-        print("Success: Pure ResNet Weights injected into Second Hybrid pipeline.")
+        self.begin = QPoint()
+        self.end = QPoint()
+        self.is_cropping = False
+        self.is_panning = False
 
-    target_stages = list(range(1, MAX_STAGES + 1))
-    print(f"Starting Multi-Stage Adaptive OCR pipeline (Stages: {target_stages})...")
-    full_set = set(range(1, MAX_ALLOWED_NUMBER + 1))
-    
-    # [메모리 최적화]: 오려낸 가벼운 낱개 사진 파편만 보관하는 보관소
-    all_stage_crop_registry = []
-    
-    for stage_num in target_stages:
-        stage_fail_buffer = []
+    def set_image(self, qimage):
+        self.original_pixmap = QPixmap.fromImage(qimage)
+        self.zoom_factor = 1.0
+        self.pan_offset = QPoint(0, 0)
+        self.update()
 
-        stage_hsv = cv2.cvtColor(only_red_stages[stage_num], cv2.COLOR_BGR2HSV)
-        s_val = hsv_thresholds[stage_num - 1]["s_min"]
-        v_val = hsv_thresholds[stage_num - 1]["v_min"]
-        
-        # [오류 완전 정정]: 누락되었던 상한선 배열값 [10, 255, 255]와 [180, 255, 255]를 정확히 삽입했습니다.
-        sm1 = cv2.inRange(stage_hsv, np.array([0, s_val, v_val]), np.array([10, 255, 255]))
-        sm2 = cv2.inRange(stage_hsv, np.array([160, s_val, v_val]), np.array([180, 255, 255]))
-        stage_red_mask = sm1 + sm2
-        stage_morph = cv2.morphologyEx(stage_red_mask, cv2.MORPH_CLOSE, kernel)
-        ocr_source_img = cv2.bitwise_not(stage_morph)
-        img_h, img_w = ocr_source_img.shape[:2]
-        
-        results_pure = reader_pure.readtext(
-            ocr_source_img, 
-            batch_size=1,
-            text_threshold=0.03, link_threshold=0.15, low_text=0.02,
-            slope_ths=0.3, ycenter_ths=0.4, height_ths=0.8, width_ths=0.9
-        )
-        
-        results_custom = reader_custom.readtext(
-            ocr_source_img, 
-            batch_size=1,
-            text_threshold=0.03, link_threshold=0.15, low_text=0.02,
-            slope_ths=0.3, ycenter_ths=0.4, height_ths=0.8, width_ths=0.9
-        )
-        
-        combined_results = []
-        for r in results_pure: combined_results.append((r, "Pure"))
-        for r_c in results_custom: combined_results.append((r_c, "Custom"))
-            
-        # 1. 신뢰도(prob) 점수가 높은 순서대로 정렬
-        combined_results.sort(key=lambda x: x[0][2], reverse=True)
+    def get_combined_transform(self):
+        transform = QTransform()
+        if not self.original_pixmap:
+            return transform
+        win_w, win_h = self.width(), self.height()
+        img_w = self.original_pixmap.width() * self.zoom_factor
+        img_h = self.original_pixmap.height() * self.zoom_factor
+        base_x = (win_w - img_w) / 2 + self.pan_offset.x()
+        base_y = (win_h - img_h) / 2 + self.pan_offset.y()
+        transform.translate(base_x, base_y)
+        transform.scale(self.zoom_factor, self.zoom_factor)
+        return transform
 
-        accepted_results = []
-        for (bbox, text, prob), source in combined_results:
-            pts = np.array(bbox, dtype=np.int32)
-            bx, by, bw, bh = cv2.boundingRect(pts)
-            current_center_x = bx + bw / 2.0
-            current_center_y = by + bh / 2.0
-
-            # 2. 이미 채택된 고신뢰도 결과의 좌표와 비교하여 중복 여부 체크
-            is_duplicate = False
-            for (a_bbox, a_text, a_prob), a_source in accepted_results:
-                a_pts = np.array(a_bbox, dtype=np.int32)
-                abx, aby, abw, abh = cv2.boundingRect(a_pts)
-                assigned_center_x = abx + abw / 2.0
-                assigned_center_y = aby + abh / 2.0
-
-                # 두 글자의 중심점 거리가 15픽셀 이내라면 동일한 위치의 스탬프로 판단
-                distance = np.sqrt((current_center_x - assigned_center_x)**2 + (current_center_y - assigned_center_y)**2)
-                if distance < 15:  # 도면 해상도에 따라 10~25 사이로 조절 가능
-                    is_duplicate = True
-                    break
-
-            # 3. 중복되지 않은 가장 정답에 가까운(prob가 높은) 결과만 최종 루프에 진입시킴
-            if not is_duplicate:
-                accepted_results.append(((bbox, text, prob), source))
-
-        for (bbox, text, prob), source in combined_results:
-            raw_text = str(text).upper().strip()
-            
-            # [메모리 절약]: 스탬프 구역만큼만 오려냅니다.
-            pts = np.array(bbox, dtype=np.int32)
-            x1 = int(max(0, np.min(pts[:, 0])))
-            x2 = int(min(img_w, np.max(pts[:, 0])))
-            y1 = int(max(0, np.min(pts[:, 1])))
-            y2 = int(min(img_h, np.max(pts[:, 1])))
-            
-            crop_img = None
-            if (x2 - x1) > 0 and (y2 - y1) > 0:
-                crop_img = ocr_source_img[y1:y2, x1:x2].copy()
-            
-            if prob < 0.15:
-                if crop_img is not None:
-                    all_stage_crop_registry.append((crop_img, bbox, raw_text, prob))
-                stage_fail_buffer.append(f"  [실패] {source} -> 원래텍스트: '{raw_text}' | 원인: 점수 미달 (Prob: {prob:.2f})")
-                continue
-
-            replacements = {
-                'I': '1', 'L': '1', 'O': '0', 'Z': '2', 'S': '5', 'T': '7', 'B': '8', 'G': '9'
-            }
-            fixed_text = ""
-            for char in raw_text:
-                fixed_text += replacements.get(char, char)
-
-            extracted_numbers = re.findall(r'\d+', fixed_text)
-            
-            if not extracted_numbers:
-                if crop_img is not None:
-                    all_stage_crop_registry.append((crop_img, bbox, raw_text, prob))
-                stage_fail_buffer.append(f"  [실패] {source} -> 원래텍스트: '{raw_text}' | 원인: 내부 숫자 분할 정제 실패")
-                continue
-
-            for num_str in extracted_numbers:
-                try:
-                    val_int = int(num_str)
-                    if not (1 <= val_int <= MAX_ALLOWED_NUMBER):
-                        if crop_img is not None:
-                            all_stage_crop_registry.append((crop_img, bbox, raw_text, prob))
-                        stage_fail_buffer.append(f"  [실패] {source} -> 원래텍스트: '{raw_text}' (추출조각: {val_int}) | 원인: 일련번호 허용 범위 초과")
-                        continue
-                    clean_text = str(val_int)
-                except ValueError:
-                    if crop_img is not None:
-                        all_stage_crop_registry.append((crop_img, bbox, raw_text, prob))
-                    stage_fail_buffer.append(f"  [실패] {source} -> 추출조각문자: '{num_str}' | 원인: 수치 형식 변환 실패")
-                    continue
-
-                bx, by, bw, bh = cv2.boundingRect(pts)
-                center_x = int((bx + bw / 2.0) / scale_factor)
-                center_y = int((by + bh / 2.0) / scale_factor)
-
-                center_x = max(0, min(w - 1, center_x))
-                center_y = max(0, min(h - 1, center_y))
-
-                assigned_row, assigned_col = None, None
-                EPSILON = 2  # 픽셀 단위 여유 마진
-
-                
-                for r_idx in range(num_rows):
-                    if y_bounds[r_idx] <= center_y <= y_bounds[r_idx+1]:
-                        assigned_row = rows[r_idx]
-                        break
-                for c_idx in range(num_cols):
-                    if x_bounds[c_idx] <= center_x <= x_bounds[c_idx+1]:
-                        assigned_col = cols[c_idx]
-                        break
-                        
-                if assigned_row is not None and assigned_col is not None:
-                    grid_location = f"{assigned_row}{assigned_col}"
-                    if grid_location not in cross_validated_raw_data:
-                        cross_validated_raw_data[grid_location] = set()
-                    cross_validated_raw_data[grid_location].add(clean_text)
-                    successfully_detected_numbers.add(val_int)
-                    if crop_img is not None:
-                        all_stage_crop_registry.append((crop_img, bbox, raw_text, prob))
-                    print(f"  [성공] {source} -> 격자 안착 완료: {grid_location} | 최종숫자: {val_int}")
-                else:
-                    if crop_img is not None:
-                        all_stage_crop_registry.append((crop_img, bbox, raw_text, prob))
-                    stage_fail_buffer.append(f"  [실패] {source} -> 추출숫자: {val_int} | 원래텍스트: '{raw_text}' | 원인: 구역 그리드 좌표 이탈 (Center: {center_x}, {center_y})")
-
-        if stage_fail_buffer:
-            stage_title = f"\n--- [Analyzing Only-Red Stage {stage_num} / {MAX_STAGES}] ---"
-            print(stage_title)
-            with open(txt_log_path, "a", encoding="utf-8") as log_f:
-                log_f.write(f"{stage_title}\n")
-                for fail_log in stage_fail_buffer:
-                    print(fail_log)
-                    log_f.write(f"{fail_log}\n")
-
-        current_missing = full_set - successfully_detected_numbers
-        stage_end_msg = f"-> Stage {stage_num} 완료: 현재 누락된 번호 개수 = {len(current_missing)}개"
-        print(stage_end_msg)
-        with open(txt_log_path, "a", encoding="utf-8") as log_f:
-            log_f.write(f"{stage_end_msg}\n")
-        
-        if len(current_missing) == 0:
-            print("-> 모든 일련번호가 찾아져 연산을 조기 종료합니다.")
-            break
-
-    cv2.destroyAllWindows()
-
-    missing_numbers = sorted(list(full_set - successfully_detected_numbers))
-
-    num_loc_counts = {}
-    for loc, num_set in cross_validated_raw_data.items():
-        for num in num_set:
-            if num not in num_loc_counts:
-                num_loc_counts[num] = {}
-            num_loc_counts[num][loc] = num_loc_counts[num].get(loc, 0) + 1
-
-    detected_numbers_summary = []
-    for num, loc_dict in num_loc_counts.items():
-        best_loc = max(loc_dict.keys(), key=lambda k: loc_dict[k])
-        detected_numbers_summary.append((num, best_loc))
-
-    # [수정 완료]: 인덱스 슬라이싱 x[0]과 x[1]을 정교하게 명시하여 무조건 에러가 발생하지 않도록 패스 처리함
-    detected_numbers_summary.sort(key=lambda x: (int(x[0]) if x[0].isdigit() else 999, x[1]))
-
-    sys.modules[__name__].missing_numbers_global = missing_numbers
-    sys.modules[__name__].total_stages_run = stage_num
-
-except Exception as ocr_error:
-    print("\n" + "!"*60)
-    print("CRITICAL CRASH DETECTED DURING OCR PROCESSING")
-    print("!"*60)
-    traceback.print_exc()
-    input("Press Enter to close the program...")
-    sys.exit(-1)
-print(" 도면 내 일련번호 누락 검증 결과")
-print("!"*50)
-
-with open(txt_log_path, "a", encoding="utf-8") as log_f:
-    log_f.write("\n" + "!"*50 + "\n")
-    log_f.write(" Final Drawing OCR Audit Result\n")
-    log_f.write("!"*50 + "\n")
-    
-    if missing_numbers:
-        warn_msg1 = f"-> [경고] {len(missing_numbers)}개의 번호가 도면에서 누락(미인식)되었습니다."
-        warn_msg2 = f"-> 누락된 번호 목록: {missing_numbers}"
-        print(warn_msg1)
-        print(warn_msg2)
-        log_f.write(f"{warn_msg1}\n{warn_msg2}\n")
-    else:
-        ok_msg = "-> [완벽] 1번부터 끝 번호까지 누락된 일련번호가 전혀 없습니다!"
-        print(ok_msg)
-        log_f.write(f"{ok_msg}\n")
-        
-    log_f.write("!"*50 + "\n")
-print("!"*50 + "\n")
-
-print(f"OCR maximum value filtering completed successfully.\nLog file saved at: {txt_log_path}")
-
-# ==========================================
-# [파인튜닝 데이터셋 수집 시스템]: 초경량 파편 파일 물리 저장소 격리 보관
-# ==========================================
-try:
-    dataset_success_dir = os.path.join(base_dir, f"{file_name_only}_dataset_success")
-    dataset_fail_dir = os.path.join(base_dir, f"{file_name_only}_dataset_fail")
-    os.makedirs(dataset_success_dir, exist_ok=True)
-    os.makedirs(dataset_fail_dir, exist_ok=True)
-
-    print("\nExtracting Fine-tuning Dataset images from all stages...")
-    
-    if 'all_stage_crop_registry' in locals() and all_stage_crop_registry:
-        save_counter = 0
-        # 3부에서 미리 초경량으로 다 오려둔 crop_img 알맹이를 안전하게 다이렉트로 다운로드 처리
-        for crop_img, bbox, raw_text, prob in all_stage_crop_registry:
-            replacements = {'I': '1', 'L': '1', 'O': '0', 'Z': '2', 'S': '5', 'T': '7', 'B': '8', 'G': '9'}
-            fixed_text = "".join([replacements.get(char, char) for char in raw_text])
-            extracted_numbers = re.findall(r'\d+', fixed_text)
-            
-            if prob >= 0.15 and extracted_numbers:
-                for num_str in extracted_numbers:
-                    val_int = int(num_str)
-                    if 1 <= val_int <= MAX_ALLOWED_NUMBER:
-                        save_name = os.path.join(dataset_success_dir, f"{val_int}_인식성공_{save_counter}.png")
-                        cv2.imencode('.png', crop_img).tofile(save_name)
-                        save_counter += 1
+    def wheelEvent(self, event):
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier and self.original_pixmap:
+            old_zoom = self.zoom_factor
+            if event.angleDelta().y() > 0:
+                self.zoom_factor *= 1.15
             else:
-                clean_filename = re.sub(r'[\/:*?"<>|]', '', raw_text)
-                if not clean_filename: clean_filename = "unknown"
-                save_name = os.path.join(dataset_fail_dir, f"{clean_filename}_인식실패_{save_counter}.png")
-                cv2.imencode('.png', crop_img).tofile(save_name)
-                save_counter += 1
+                self.zoom_factor /= 1.15
+            self.zoom_factor = max(0.1, min(self.zoom_factor, 10.0))
+            mouse_pos = event.position().toPoint()
+            mouse_at_img = (mouse_pos - self.pan_offset - QPoint(int(self.width()/2), int(self.height()/2))) / old_zoom
+            self.pan_offset += (mouse_at_img * old_zoom - mouse_at_img * self.zoom_factor)
+            self.update()
+        else:
+            super().wheelEvent(event)
+    def mousePressEvent(self, event):
+        if not self.original_pixmap:
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.last_mouse_pos = event.position().toPoint()
+            self.is_panning = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.begin = event.position().toPoint()
+            self.end = event.position().toPoint()
+            self.is_cropping = True
 
-        print(f"-> Success Dataset saved successfully at: {dataset_success_dir}")
-        print(f"-> Fail Dataset saved successfully at: {dataset_fail_dir}")
-    else:
-        print("-> [안내] 저장할 데이터셋 메모리 맵 레지스트리가 비어있습니다.")
+    def mouseMoveEvent(self, event):
+        if self.is_panning:
+            delta = event.position().toPoint() - self.last_mouse_pos
+            self.pan_offset += delta
+            self.last_mouse_pos = event.position().toPoint()
+            self.update()
+        elif self.is_cropping:
+            self.end = event.position().toPoint()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton and self.is_panning:
+            self.is_panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        elif event.button() == Qt.MouseButton.LeftButton and self.is_cropping:
+            self.end = event.position().toPoint()
+            self.is_cropping = False
+            self.update()
+            
+            screen_rect = QRect(self.begin, self.end).normalized()
+            if screen_rect.width() > 5 and screen_rect.height() > 5 and self.original_pixmap:
+                inv_trans, success = self.get_combined_transform().inverted()
+                if success:
+                    img_top_left = inv_trans.map(screen_rect.topLeft())
+                    img_bottom_right = inv_trans.map(screen_rect.bottomRight())
+                    image_pixel_rect = QRect(img_top_left, img_bottom_right).normalized()
+                    self.drag_finished_signal.emit(screen_rect, image_pixel_rect)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(236, 236, 236))
+        if self.original_pixmap:
+            painter.setTransform(self.get_combined_transform())
+            painter.drawPixmap(0, 0, self.original_pixmap)
+            painter.resetTransform()
+        if self.is_cropping and not self.begin.isNull() and not self.end.isNull():
+            pen = QPen(QColor(226, 107, 10, 200), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(QRect(self.begin, self.end).normalized())
+
+
+# 🛠️ [무한 루프 수정완료] 튜플/리스트에서 안전하게 요소를 꺼내오도록 변경
+def clean_file_path(raw_path):
+    if not raw_path: return ""
+    while isinstance(raw_path, (tuple, list)):
+        if len(raw_path) > 0: 
+            raw_path = raw_path[0]  # 대괄호 [0] 인덱싱 추가로 언팩킹 유도
+        else: 
+            return ""
+    path_str = str(raw_path).strip()
+    path_str = path_str.lstrip("([\u201c\u201d'\"").rstrip(")]\u201c\u201d'\",")
+    return re.sub(r"['\"]?,?\s*$", "", path_str).strip("'\" ")
+
+
+class PdfLoadWorker(QThread):
+    loaded_signal = pyqtSignal(bytes)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = clean_file_path(file_path)
+
+    def run(self):
+        try:
+            file_path_str = str(self.file_path)
+            is_pdf = bool(re.search(r"\.pdf", file_path_str, re.IGNORECASE))
+            if is_pdf:
+                pages = convert_from_path(file_path_str, dpi=300, poppler_path=POPPLER_PATH)
+                if len(pages) > 0:
+                    first_page = pages[0]
+                    buffer = io.BytesIO()
+                    first_page.save(buffer, format="JPEG")
+                    self.loaded_signal.emit(buffer.getvalue())
+                else:
+                    raise Exception("PDF 내부에서 페이지를 찾을 수 없습니다.")
+            else:
+                with open(file_path_str, "rb") as f:
+                    self.loaded_signal.emit(f.read())
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+class OcrWorker(QThread):
+    text_chunk_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, base64_image):
+        super().__init__()
+        self.base64_image = base64_image
+
+    def run(self):
+        payload = {
+            "model": "qwen2.5-vl-7b",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "너는 도면 전문 고정밀 시각-언어(VLM) OCR 엔진이야. 도면 내 모든 치수를 찾아 값과 위치 좌표를 추출해야 해."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text", 
+                            "text": (
+                                "제공된 설계 도면 이미지에서 식별 가능한 모든 치수 숫자 데이터와 그 위치 좌표를 빠짐없이 전부 추출해줘.\n"
+                                "출력 포맷은 반드시 아래 예시와 같은 순수한 JSON 배열 형식이어야 하며, 어떠한 마크다운 백틱(```json)이나 설명 문장도 포함하지 마라.\n\n"
+                                "하단 규칙을 엄격하게 준수해라:\n"
+                                "1. value: 치수 숫자는 반드시 소수점 딱 1자리까지만 표시해라 (예: 550 -> \"550.0\").\n"
+                                "2. box_2d: 해당 치수 글자가 위치한 구역을 이미지 전체 크기 대비 [ymin, xmin, ymax, xmax] 형태의 1000분율 정수 좌표로 정확히 매핑해라 (0~1000 사이 값).\n\n"
+                                "출력 예시:\n"
+                                "[\n"
+                                "  {\"value\": \"550.0\", \"box_2d\": [290, 180, 340, 240]},\n"
+                                "  {\"value\": \"192.0\", \"box_2d\": [401, 80, 442, 130]}\n"
+                                "]"
+                            )
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self.base64_image}"}}
+                    ]
+                }
+            ],
+            "temperature": 0.01,
+            "stream": True  
+        }
+        full_response = ""
+        try:
+            response = requests.post(LM_STUDIO_URL, json=payload, timeout=150, stream=True)
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8').strip()
+                    if "[DONE]" in decoded_line: 
+                        break
+                    if decoded_line.startswith("data: "):
+                        data_str = decoded_line[6:].strip()
+                        try:
+                            data_json = json.loads(data_str)
+                            if not data_json.get('choices'): 
+                                continue
+                            content = data_json['choices'][0]['delta'].get('content', '')
+                            if content:
+                                full_response += content
+                                # 실시간 로그 출력을 위해 계속 신호는 보냅니다.
+                                self.text_chunk_signal.emit(content)
+                        except: 
+                            pass
+            self.finished_signal.emit(full_response)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+class CropOcrWorker(QThread):
+    crop_finished_signal = pyqtSignal(str, str)
+
+    def __init__(self, crop_base64, box_str):
+        super().__init__()
+        self.crop_base64 = crop_base64  # ◀ 여기서 저장한 변수명을
+        self.box_str = box_str
+
+    def run(self):
+        payload = {
+            "model": "qwen2.5-vl-7b",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text", 
+                            "text": "이 잘라낸 도면 이미지 조각 안에 적혀있는 핵심 치수 숫자가 무엇인지 숫자만 딱 대답해줘. 예: 110.0"
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self.crop_base64}"}}
+                    ]
+                }
+            ],
+            "temperature": 0.01
+        }
+        try:
+            response = requests.post(LM_STUDIO_URL, json=payload, timeout=30)
+            result = response.json()
+            ai_digit = result['choices'][0]['message']['content'].strip()
+            digit_match = re.search(r"\d+\.\d+|\d+", ai_digit)
+            if digit_match:
+                val = float(digit_match.group(0))
+                ai_digit = f"{val:.1f}"
+            self.crop_finished_signal.emit(ai_digit, self.box_str)
+        except Exception as e:
+            self.crop_finished_signal.emit("0.0", self.box_str)
+
+class DrawingOcrApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.selected_file_path = ""
+        self.base64_img_data = ""
+        self.raw_image_bytes = None
+        self.qimage_source = None
+        self.stream_buffer = ""  
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("도면 인터랙티브 고정밀 OCR 시스템 (실시간 동적 수집 버전)")
+        self.setGeometry(50, 50, 1300, 800)
         
-except Exception as dataset_error:
-    print("\n[수집 엔진 내부 에러 발생]:")
-    traceback.print_exc()
-
-# ==========================================
-# 5단계: 이미지 마크업 오버레이 및 시각화 저장
-# ==========================================
-output_image = image.copy()
-box_overlay = output_image.copy()
-
-for r_idx in range(num_rows):
-    for c_idx in range(num_cols):
-        x_min, x_max = int(x_bounds[c_idx]), int(x_bounds[c_idx+1])
-        y_min, y_max = int(y_bounds[r_idx]), int(y_bounds[r_idx+1])
-        label_text = f"{rows[r_idx]}{cols[c_idx]}"
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
         
-        font_scale = max(0.6, h / 2500.0) 
-        thickness = max(1, int(font_scale * 1.2))
-        (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        left_panel = QVBoxLayout()
+        self.canvas_title = QLabel("도면 시각화 뷰어 (Ctrl+휠: 확대축소 / 우클릭드래그: 화면이동 / 좌클릭드래그: 부분정밀분석)")
+        self.canvas_title.setFont(QFont("맑은 고딕", 10, QFont.Weight.Bold))
         
-        center_x, center_y = int((x_min + x_max) / 2), int((y_min + y_max) / 2)
-        cv2.rectangle(box_overlay, (center_x - int(text_w / 2) - 5, center_y - int(text_h / 2) - 5), (center_x + int(text_w / 2) + 5, center_y + int(text_h / 2) + 5), (255, 255, 255), -1)
-        cv2.rectangle(box_overlay, (center_x - int(text_w / 2) - 5, center_y - int(text_h / 2) - 5), (center_x + int(text_w / 2) + 5, center_y + int(text_h / 2) + 5), (0, 0, 0), 1)
-
-cv2.addWeighted(box_overlay, 0.7, output_image, 0.3, 0, output_image)
-
-for r_idx in range(num_rows):
-    for c_idx in range(num_cols):
-        x_min, x_max = int(x_bounds[c_idx]), int(x_bounds[c_idx+1])
-        y_min, y_max = int(y_bounds[r_idx]), int(y_bounds[r_idx+1])
-        label_text = f"{rows[r_idx]}{cols[c_idx]}"
+        self.canvas = DrawingCanvas()
+        self.canvas.drag_finished_signal.connect(self.handle_user_crop_drag)
         
-        font_scale = max(0.6, h / 2500.0) 
-        thickness = max(1, int(font_scale * 1.2))
-        (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-        cv2.putText(output_image, label_text, (int((x_min + x_max) / 2) - int(text_w / 2), int((y_min + y_max) / 2) + int(text_h / 2)), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
-        cv2.rectangle(output_image, (x_min, y_min), (x_max, y_max), (100, 255, 100), 3) 
+        control_layout = QHBoxLayout()
+        btn_open = QPushButton("도면 파일 가져오기")
+        btn_open.setFixedHeight(35)
+        btn_open.clicked.connect(self.open_file)
         
-        for stage_idx in range(1, 31):
-            if stage_idx in only_red_stages:
-                cv2.rectangle(only_red_stages[stage_idx], (int(x_min * 2.0), int(y_min * 2.0)), (int(x_max * 2.0), int(y_max * 2.0)), (100, 255, 100), 5)
+        self.btn_run = QPushButton("인공지능 도면 정밀 분석 시작")
+        self.btn_run.setFixedHeight(35)
+        self.btn_run.setEnabled(False)
+        self.btn_run.clicked.connect(self.run_ocr)
+        
+        control_layout.addWidget(btn_open)
+        control_layout.addWidget(self.btn_run)
+        
+        self.log_viewer = QLabel("실시간 서버 분석 데이터 매핑 상태 로그창...")
+        self.log_viewer.setMinimumHeight(100)
+        self.log_viewer.setStyleSheet("background-color: #222222; color: #00FF00; padding: 8px;")
+        self.log_viewer.setFont(QFont("Consolas", 9))
+        self.log_viewer.setWordWrap(True)
+        
+        left_panel.addWidget(self.canvas_title)
+        left_panel.addWidget(self.canvas, 1) 
+        left_panel.addLayout(control_layout)
+        left_panel.addWidget(self.log_viewer)
+        
+        right_panel = QVBoxLayout()
+        table_title = QLabel("추출 및 보정 데이터 리스트 (더블클릭하여 실시간 수정 및 추가)")
+        table_title.setFont(QFont("맑은 고딕", 10, QFont.Weight.Bold))
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["최종 확인 치수값", "매핑 좌표 (ymin, xmin, ymax, xmax)", "유형"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
-if ext_check.lower() == '.pdf': 
-    ext_check = '.png'
+        table_edit_layout = QHBoxLayout()
+        btn_add = QPushButton("수동 항목 행 추가")
+        btn_add.clicked.connect(self.add_manual_row)
+        btn_del = QPushButton("선택 행 삭제")
+        btn_del.clicked.connect(self.delete_row)
+        table_edit_layout.addWidget(btn_add)
+        table_edit_layout.addWidget(btn_del)
+        
+        btn_save_excel = QPushButton("보정 완료본 엑셀 내보내기")
+        btn_save_excel.setFixedHeight(40)
+        btn_save_excel.setStyleSheet("background-color: #4F81BD; color: white; font-weight: bold;")
+        btn_save_excel.clicked.connect(self.save_excel_file)
+        
+        self.btn_save_dataset = QPushButton("드래그한 보정본을 AI 피드백 학습 데이터셋으로 영구 저장")
+        self.btn_save_dataset.setFixedHeight(45)
+        self.btn_save_dataset.setStyleSheet("background-color: #E26B0A; color: white; font-weight: bold;")
+        self.btn_save_dataset.clicked.connect(self.save_dataset_file)
+        
+        right_panel.addWidget(table_title)
+        right_panel.addWidget(self.table, 1)
+        right_panel.addLayout(table_edit_layout)
+        right_panel.addWidget(btn_save_excel)
+        right_panel.addWidget(self.btn_save_dataset)
+        
+        main_layout.addLayout(left_panel, 55)
+        main_layout.addLayout(right_panel, 45)
 
-output_img_path = os.path.join(base_dir, f"{file_name_only}_grid_result{ext_check}")
-success1, im_buf1 = cv2.imencode(ext_check, output_image)
-if success1:
-    im_buf1.tofile(output_img_path)
-    print(f"Standard grid image saved to: {output_img_path}")
+    def open_file(self):
+        import ctypes
+        from ctypes import wintypes
+        buffer_size = 260
+        filename_buffer = ctypes.create_unicode_buffer(buffer_size)
+        
+        class OPENFILENAMEW(ctypes.Structure):
+            _fields_ = [
+                ("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE), ("lpstrFilter", wintypes.LPCWSTR),
+                ("lpstrCustomFilter", wintypes.LPWSTR), ("nMaxCustFilter", wintypes.DWORD),
+                ("nFilterIndex", wintypes.DWORD), ("lpstrFile", wintypes.LPWSTR),
+                ("nMaxFile", wintypes.DWORD), ("lpstrFileTitle", wintypes.LPWSTR),
+                ("nMaxFileTitle", wintypes.DWORD), ("lpstrInitialDir", wintypes.LPCWSTR),
+                ("lpstrTitle", wintypes.LPCWSTR), ("Flags", wintypes.DWORD),
+                ("nFileOffset", wintypes.WORD), ("nFileExtension", wintypes.WORD),
+                ("lpstrDefExt", wintypes.LPCWSTR), ("lCustData", wintypes.LPARAM),
+                ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wintypes.LPCWSTR),
+                ("pvReserved", ctypes.c_void_p), ("dwReserved", wintypes.DWORD),
+                ("FlagsEx", wintypes.DWORD)
+            ]
+            
+        ofn = OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+        ofn.hwndOwner = int(self.winId())
+        ofn.lpstrFile = ctypes.cast(filename_buffer, wintypes.LPWSTR)
+        ofn.nMaxFile = buffer_size
+        ofn.lpstrFilter = "모든 도면 파일 (*.pdf;*.png;*.jpg)\0*.pdf;*.png;*.jpg\0모든 파일 (*.*)\0*.*\0"
+        ofn.Flags = 0x00080000 | 0x00000800 
+        
+        comdlg32 = ctypes.windll.comdlg32
+        if comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+            self.selected_file_path = clean_file_path(filename_buffer.value)
+            if not self.selected_file_path: return
+            
+            self.log_viewer.setText("도면 파일을 고해상도로 안전 변환하는 중입니다. 잠시만 기다려주세요...")
+            self.btn_run.setEnabled(False)
+            
+            self.load_worker = PdfLoadWorker(self.selected_file_path)
+            self.load_worker.loaded_signal.connect(self.on_file_loaded)
+            self.load_worker.error_signal.connect(self.on_file_load_error)
+            self.load_worker.start()
 
-for stage_idx in range(1, 31):
-    if stage_idx in only_red_stages:
-        suffix = f"_only red {stage_idx}" if stage_idx > 1 else "_only red"
-        stage_out_path = os.path.join(base_dir, f"{file_name_only}{suffix}{ext_check}")
-        success_stage, im_buf_stage = cv2.imencode(ext_check, only_red_stages[stage_idx])
-        if success_stage:
-            im_buf_stage.tofile(stage_out_path)
-            print(f"Only-Red stage {stage_idx} image saved to: {stage_out_path}")
+    def on_file_loaded(self, img_bytes):
+        self.raw_image_bytes = img_bytes
+        self.qimage_source = QImage.fromData(self.raw_image_bytes)
+        self.canvas.set_image(self.qimage_source)
+        
+        file_name = os.path.basename(self.selected_file_path)
+        self.canvas_title.setText(f"도면 시각화 뷰어 - {file_name}")
+        self.log_viewer.setText("도면 파일 로딩 및 고해상도 변환 완료! 분석을 시작할 수 있습니다.")
+        self.btn_run.setEnabled(True)
 
-# 최종 CSV 보고서 작성 (UTF-8-SIG 적용)
-csv_report_path = os.path.join(base_dir, f"{file_name_only}_report.csv")
-with open(csv_report_path, "w", newline="", encoding="utf-8-sig") as f:
-    writer = csv.writer(f)
-    writer.writerow(["Number", "Location"])
-    for num, loc in detected_numbers_summary:
-        writer.writerow([num, loc])
-    
-    missing_list = getattr(sys.modules[__name__], 'missing_numbers_global', [])
-    if missing_list:
-        writer.writerow([])
-        writer.writerow(["[MISSING NUMBERS CONTROL]"])
-        writer.writerow(["Total Missing Count", len(missing_list)])
-        writer.writerow(["Missing Numbers List", str(missing_list)])
+    def on_file_load_error(self, err):
+        QMessageBox.critical(self, "변환 오류", f"도면 고해상도 변환에 실패했습니다:\n{err}")
 
-print(f"\nReport saved to: {csv_report_path}")
-input("Process finished. Press Enter to exit...")
+    def run_ocr(self):
+        if not self.raw_image_bytes: return
+        self.base64_img_data = base64.b64encode(self.raw_image_bytes).decode('utf-8')
+        self.log_viewer.setText("인공지능 연산 가동 중... (실시간으로 표에 치수가 누적됩니다)\n")
+        self.table.setRowCount(0)
+        self.stream_buffer = "" 
+        
+        self.worker = OcrWorker(self.base64_img_data)
+        self.worker.text_chunk_signal.connect(self.append_log_and_stream_parse)
+        self.worker.finished_signal.connect(self.on_ocr_finished)
+        self.worker.error_signal.connect(self.handle_error)
+        self.worker.start()
+        self.btn_run.setEnabled(False)
+
+    def append_log_and_stream_parse(self, text):
+        """💡 [오작동 해결]: 값과 좌표가 '동시에 완벽히 일치'하여 제자리를 무한 반복할 때만 안전하게 차단합니다."""
+        # 1. 녹색 로그창 실시간 축적 출력
+        current_text = self.log_viewer.text()
+        if "인공지능 전체" in current_text or "연산 가동" in current_text:
+            new_text = text
+        else:
+            new_text = current_text + text
+        if len(new_text) > 800:
+            new_text = "..." + new_text[-800:]
+        self.log_viewer.setText(new_text)
+        
+        # 데이터 유입 축적
+        self.stream_buffer += text
+
+        # 2. 정규식 매칭 가동
+        matches = re.findall(r'\{\s*"value"\s*:\s*"([^"]*)"\s*,\s*"box_2d"\s*:\s*(\[[^\]]*\])\s*\}', self.stream_buffer)
+        
+        if matches:
+            for val, box_str in matches:
+                try:
+                    val = f"{float(val):.1f}"
+                except:
+                    pass
+                
+                row_count = self.table.rowCount()
+                
+                # --------------------------------------------------------------
+                # 🚨 [초정밀 필터]: 값(Value)과 좌표(Box) 세트가 완벽히 동일할 때만 루프로 인정
+                # --------------------------------------------------------------
+                if row_count >= 8:
+                    # 표에 들어있는 [값_좌표]를 공백 없이 고유 키로 문자열 결합
+                    # 예시: "436.0_[920,1410,970,1460]"
+                    existing_pairs = [
+                        f"{self.table.item(r,0).text()}_{re.sub(r'\s+', '', self.table.item(r,1).text())}" 
+                        for r in range(row_count)
+                    ]
+                    current_pair = f"{val}_{re.sub(r'\s+', '', box_str)}"
+                    
+                    is_loop_detected = False
+                    
+                    # 4개부터 12개 패턴 크기로 완벽 일치 흐름 조사
+                    for pattern_size in range(4, min(13, row_count + 1)):
+                        target_pattern = existing_pairs[-(pattern_size - 1):] + [current_pair]
+                        history_slice = existing_pairs[:-(pattern_size - 1)]
+                        
+                        for i in range(len(history_slice) - pattern_size + 1):
+                            if history_slice[i:i+pattern_size] == target_pattern:
+                                is_loop_detected = True
+                                break
+                        if is_loop_detected: break
+                    
+                    if is_loop_detected:
+                        self.log_viewer.setText("⚠️ [진짜 무한루프 차단] 값과 좌표가 완전히 일치하는 환각 반복 루프를 포착하여 안전하게 종료합니다.")
+                        if hasattr(self, 'worker') and self.worker.isRunning():
+                            self.worker.blockSignals(True)
+                            self.worker.terminate()
+                            self.worker.wait()
+                            self.btn_run.setEnabled(True)
+                        return
+                # --------------------------------------------------------------
+                
+                # 좌표가 다르면 정상 데이터이므로 표에 실시간 추가
+                self.add_table_row(val, box_str, "AI 판독")
+            
+            # 파싱 끝난 블록 버퍼에서 청소
+            all_blocks = re.findall(r'\{\s*"value"\s*:\s*"[^"]*"\s*,\s*"box_2d"\s*:\s*\[[^\]]*\]\s*\}', self.stream_buffer)
+            if all_blocks:
+                last_block = all_blocks[-1]
+                last_idx = self.stream_buffer.rfind(last_block) + len(last_block)
+                self.stream_buffer = self.stream_buffer[last_idx:]
+
+    def on_ocr_finished(self, total_text):
+        """💡 이제 실시간으로 표를 채우므로 마감 함수는 UI 활성화 역할만 담당하면 됩니다."""
+        self.btn_run.setEnabled(True)
+        self.log_viewer.setText("AI 도면 전체 치수 및 박스 좌표 수집 최종 완료!")
+        
+        # 혹시 AI가 마크다운 백틱 기호(```json)를 섞어 출력했을 경우를 대비해 텍스트 정제
+        json_clean = self.stream_buffer.strip()
+        if "```json" in json_clean:
+            json_clean = json_clean.split("```json")[-1].split("```")[0].strip()
+        elif "```" in json_clean:
+            json_clean = json_clean.split("```")[1].strip()
+
+        try:
+            # 완결된 JSON 배열 분석 가동
+            parsed_data = json.loads(json_clean)
+            
+            if isinstance(parsed_data, list):
+                for item in parsed_data:
+                    val = item.get("value", "0.0")
+                    box = item.get("box_2d", [])
+                    box_str = str(box) # 표에 출력할 형태 string 변환
+                    
+                    # 소수점 포맷 보정 가동
+                    try:
+                        val = f"{float(val):.1f}"
+                    except:
+                        pass
+                        
+                    # AI가 예측한 값과 좌표를 표에 자동으로 안착시킵니다!
+                    self.add_table_row(val, box_str, "AI 판독")
+                    
+                self.log_viewer.setText(f"성공적으로 {len(parsed_data)}개의 치수 및 박스 좌표 자동 매핑 완료!")
+            else:
+                raise Exception("JSON 포맷이 배열 형식이 아닙니다.")
+                
+        except Exception as e:
+            # AI 출력이 완전한 JSON 구조를 갖추지 못해 실패한 경우, 안전하게 정규식 백업 파서 가동
+            self.log_viewer.setText("⚠️ 전체 JSON 파싱 오류 발생. 수동 정규식 백업 파서로 전환합니다.")
+            
+            # 텍스트 내에서 숫자와 좌표 구조 패턴을 추적하여 강제 매핑
+            # 패턴 예시: "value": "192.0", "box_2d": [401, 80, 442, 130]
+            blocks = re.findall(r'\{\s*"value"\s*:\s*"[^"]*"\s*,\s*"box_2d"\s*:\s*\[[^\]]*\]\s*\}', json_clean)
+            
+            if blocks:
+                for block in blocks:
+                    try:
+                        item = json.loads(block)
+                        val = f"{float(item.get('value', '0.0')):.1f}"
+                        box_str = str(item.get('box_2d', []))
+                        self.add_table_row(val, box_str, "AI 판독")
+                    except:
+                        pass
+            else:
+                QMessageBox.warning(self, "파싱 경고", f"AI 응답 데이터를 구조화하는 데 실패했습니다.\n출력 데이터를 확인해 주세요.\n에러내용: {e}")
+
+    def on_ocr_finished(self, total_text):
+        self.btn_run.setEnabled(True)
+        if self.stream_buffer.strip() and any(char.isdigit() for char in self.stream_buffer):
+            final_dim = self.stream_buffer.lstrip("-*• \t").strip().replace("mm", "").strip()
+            self.add_table_row(final_dim, "[]", "AI 판독")
+        self.log_viewer.setText("AI 도면 전체 치수 텍스트 실시간 동적 스캔 완료!")
+
+    def handle_error(self, msg):
+        QMessageBox.critical(self, "인공지능 서버 통신 에러", f"LM Studio 서버 연결에 실패했습니다.\n\n상세 내용: {msg}")
+        self.btn_run.setEnabled(True)
+
+    def add_table_row(self, value, box_str, type_str):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(value))
+        self.table.setItem(row, 1, QTableWidgetItem(box_str))
+        self.table.setItem(row, 2, QTableWidgetItem(type_str))
+        if type_str in ["인간 보정", "수동 입력"]:
+            for col in range(3):
+                item = self.table.item(row, col)
+                if item: item.setForeground(Qt.GlobalColor.darkRed)
+
+    def handle_user_crop_drag(self, screen_rect, pixel_rect):
+        if self.qimage_source is None: return
+        img_w = self.qimage_source.width()
+        img_h = self.qimage_source.height()
+        
+        crop_x = max(0, min(pixel_rect.left(), img_w - 1))
+        crop_y = max(0, min(pixel_rect.top(), img_h - 1))
+        crop_w = max(5, min(pixel_rect.width(), img_w - crop_x))
+        crop_h = max(5, min(pixel_rect.height(), img_h - crop_y))
+        
+        cropped_qimage = self.qimage_source.copy(crop_x, crop_y, crop_w, crop_h)
+        
+        q_array = QByteArray()
+        q_buffer = QBuffer(q_array)
+        q_buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+        cropped_qimage.save(q_buffer, "JPEG")
+        crop_base64 = base64.b64encode(q_array.data()).decode('utf-8')
+        
+        ymin, xmin = int((crop_y / img_h) * 1000), int((crop_x / img_w) * 1000)
+        ymax, xmax = int(((crop_y + crop_h) / img_h) * 1000), int(((crop_x + crop_w) / img_w) * 1000)
+        box_string = f"[{ymin}, {xmin}, {ymax}, {xmax}]"
+
+        self.log_viewer.setText(f"드래그 영역 부분 크롭 OCR 타겟 연산 시동... 좌표: {box_string}")
+        self.crop_worker = CropOcrWorker(crop_base64, box_string)
+        self.crop_worker.crop_finished_signal.connect(self.append_cropped_result)
+        self.crop_worker.start()
+
+    def append_cropped_result(self, ai_read_value, box_string):
+        self.add_table_row(ai_read_value, box_string, "인간 보정")
+        self.log_viewer.setText(f"부분 크롭 OCR 완료! 감지값: {ai_read_value}")
+
+    def add_manual_row(self):
+        self.add_table_row("0.0", "[]", "수동 입력")
+
+    def delete_row(self):
+        row = self.table.currentRow()
+        if row >= 0: self.table.removeRow(row)
+
+    def save_excel_file(self):
+        if self.table.rowCount() == 0: return
+        save_path = os.path.join(BASE_DIR, "도면_치수_추출_결과.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "최종 보정 치수"
+        ws.append(["최종 확인 치수값", "좌표 정보"])
+        for r in range(self.table.rowCount()):
+            val = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            box = self.table.item(r, 1).text() if self.table.item(r, 1) else ""
+            ws.append([val, box])
+        try:
+            wb.save(save_path)
+            QMessageBox.information(self, "성공", f"최종 보정본 엑셀 파일 저장 완료:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"엑셀 저장 실패: {e}")
+
+    def save_dataset_file(self):
+        if self.table.rowCount() == 0 or not self.base64_img_data:
+            QMessageBox.warning(self, "경고", "누적 저장할 유효한 데이터가 없습니다.")
+            return
+        dimensions_list = []
+        for r in range(self.table.rowCount()):
+            val = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            box = self.table.item(r, 1).text() if self.table.item(r, 1) else ""
+            try: parsed_box = json.loads(box)
+            except: parsed_box = []
+            dimensions_list.append({"value": val, "box_2d": parsed_box})
+            
+        dataset_entry = {
+            "image": self.selected_file_path,
+            "conversations": [
+                {"from": "user", "value": "설계 도면 이미지 내 치수 숫자의 정확한 값과 위치 좌표 상자를 찾아 판독해줘."},
+                {"from": "assistant", "value": str(dimensions_list)}
+            ]
+        }
+        filename = f"qwen_finetune_pair_{len(dimensions_list)}.json"
+        save_path = os.path.join(DATASET_DIR, filename)
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(dataset_entry, f, ensure_ascii=False, indent=4)
+            QMessageBox.information(self, "피드백 학습 완료", f"파인튜닝 학습 쌍이 저장되었습니다:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"데이터셋 누적 실패: {e}")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = DrawingOcrApp()
+    window.show()
+    sys.exit(app.exec())
